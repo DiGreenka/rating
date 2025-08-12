@@ -14,12 +14,20 @@ class TackleRatingPlugin {
 		private $table_types;
 		private $table_categories;
 		private $nonce = 'tackle_nonce';
+		private $table_type_fields;
+		private $allowed_field_keys = ['test','length','spool'];
+		private $field_labels = [
+			'test'   => 'Тест',
+			'length' => 'Длина',
+			'spool'  => 'Объём шпули'
+		];
 
 		public function __construct() {
     global $wpdb;
     $this->table_items      = $wpdb->prefix . 'tackle_rating_items';
     $this->table_types      = $wpdb->prefix . 'tackle_rating_types';
     $this->table_categories = $wpdb->prefix . 'tackle_rating_categories';
+	$this->table_type_fields = $wpdb->prefix . 'tackle_rating_type_fields';
 
     register_activation_hook(__FILE__, [$this, 'activate']);
 
@@ -47,6 +55,7 @@ class TackleRatingPlugin {
     add_action('wp_ajax_tackle_admin_approve', [$this, 'ajax_admin_approve']);
     add_action('wp_ajax_tackle_admin_delete', [$this, 'ajax_admin_delete']);
     add_action('wp_ajax_tackle_admin_merge', [$this, 'ajax_admin_merge']);
+	add_action('wp_ajax_tackle_admin_set_type_fields', [$this, 'ajax_admin_set_type_fields']);
 
     // Шорткод
     add_shortcode('tackle_rating', [$this, 'shortcode']);
@@ -55,45 +64,58 @@ class TackleRatingPlugin {
     global $wpdb;
     $charset_collate = $wpdb->get_charset_collate();
 
-    // 1. Таблица рейтингов (типы)
-	$sql_types = "CREATE TABLE IF NOT EXISTS {$this->table_types} (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		name VARCHAR(255) NOT NULL,
-		slug VARCHAR(255) NOT NULL,
-		PRIMARY KEY (id),
-		UNIQUE KEY name_unique (name),
-		UNIQUE KEY slug_unique (slug)
-	) $charset_collate;";
+    // Типы
+    $sql_types = "CREATE TABLE IF NOT EXISTS {$this->table_types} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY name_unique (name),
+        UNIQUE KEY slug_unique (slug)
+    ) $charset_collate;";
 
-	// 2. Таблица категорий
-	$sql_categories = "CREATE TABLE IF NOT EXISTS {$this->table_categories} (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		rating_type_id BIGINT UNSIGNED NOT NULL,
-		name VARCHAR(255) NOT NULL,
-		slug VARCHAR(255) NOT NULL,
-		PRIMARY KEY (id),
-		KEY rating_type_id (rating_type_id),
-		UNIQUE KEY unique_category (rating_type_id, slug)
-	) $charset_collate;";
+    // Категории
+    $sql_categories = "CREATE TABLE IF NOT EXISTS {$this->table_categories} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        rating_type_id BIGINT UNSIGNED NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) NOT NULL,
+        PRIMARY KEY (id),
+        KEY rating_type_id (rating_type_id),
+        UNIQUE KEY unique_category (rating_type_id, slug)
+    ) $charset_collate;";
 
-    // 3. Таблица вариантов с привязкой к типу и категории
-	$sql_items = "CREATE TABLE IF NOT EXISTS {$this->table_items} (
-		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-		rating_type_id BIGINT UNSIGNED NOT NULL,
-		category_id BIGINT UNSIGNED NOT NULL,
-		name VARCHAR(255) NOT NULL,
-		slug VARCHAR(255) NOT NULL,
-		votes INT UNSIGNED NOT NULL DEFAULT 0,
-		approved TINYINT(1) NOT NULL DEFAULT 0,
-		PRIMARY KEY (id),
-		UNIQUE KEY unique_item (rating_type_id, category_id, slug),
-		KEY rating_type_id (rating_type_id),
-		KEY category_id (category_id)
-	) $charset_collate;";
+    // Активные доп.поля для каждого типа
+    $sql_type_fields = "CREATE TABLE IF NOT EXISTS {$this->table_type_fields} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        rating_type_id BIGINT UNSIGNED NOT NULL,
+        field_key VARCHAR(20) NOT NULL, /* test|length|spool */
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq (rating_type_id, field_key)
+    ) $charset_collate;";
+
+    // Элементы
+    $sql_items = "CREATE TABLE IF NOT EXISTS {$this->table_items} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        rating_type_id BIGINT UNSIGNED NOT NULL,
+        category_id BIGINT UNSIGNED NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        slug VARCHAR(255) NOT NULL,
+        field_test VARCHAR(255) DEFAULT '',
+        field_length VARCHAR(255) DEFAULT '',
+        field_spool VARCHAR(255) DEFAULT '',
+        votes INT UNSIGNED NOT NULL DEFAULT 0,
+        approved TINYINT(1) NOT NULL DEFAULT 0,
+        PRIMARY KEY (id),
+        UNIQUE KEY unique_item (rating_type_id, category_id, slug),
+        KEY rating_type_id (rating_type_id),
+        KEY category_id (category_id)
+    ) $charset_collate;";
 
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql_types);
     dbDelta($sql_categories);
+    dbDelta($sql_type_fields);
     dbDelta($sql_items);
 }
 
@@ -150,6 +172,92 @@ class TackleRatingPlugin {
         }
     }
 }
+	
+		private function normalize_test($raw) {
+    $s = trim(mb_strtolower((string)$raw));
+    if ($s === '') return '';
+
+    $s = str_replace(',', '.', $s);
+    $s = preg_replace('/\s+/', '', $s);
+
+    // диапазон "0.8-5"
+    if (preg_match('/^(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)$/', $s, $m)) {
+        $a = rtrim(rtrim($m[1], '0'), '.');
+        $b = rtrim(rtrim($m[2], '0'), '.');
+        return $a . '-' . $b . ' гр';
+    }
+    // одиночное число
+    if (preg_match('/^\d+(?:\.\d+)?$/', $s)) {
+        $num = (float)$s;
+        return (intval($num) == $num ? intval($num) : rtrim(rtrim(number_format($num,2,'.',''), '0'), '.')) . ' гр';
+    }
+    // выдернем первое число из свободного текста
+    if (preg_match('/(\d+(?:[.,]\d+)?)/', $raw, $m)) {
+        $num = (float) str_replace(',', '.', $m[1]);
+        return (intval($num) == $num ? intval($num) : rtrim(rtrim(number_format($num,2,'.',''), '0'), '.')) . ' гр';
+    }
+    return trim($raw);
+}
+
+private function normalize_length($raw) {
+    $s = trim(mb_strtolower((string)$raw));
+    if ($s === '') return '';
+
+    $s = str_replace(',', '.', $s);
+    $s = preg_replace('/\s+/', '', $s);
+
+    // диапазон
+    if (preg_match('/^(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)$/', $s, $m)) {
+        $a = (float)$m[1]; $b = (float)$m[2];
+        if ($a >= 100) $a /= 100; // 270 => 2.70
+        if ($b >= 100) $b /= 100;
+        return number_format($a,2,'.','') . '-' . number_format($b,2,'.','') . ' м';
+    }
+    // одиночное число
+    if (preg_match('/^\d+(?:\.\d+)?$/', $s)) {
+        $num = (float)$s;
+        if ($num >= 100) $num /= 100;
+        return number_format($num,2,'.','') . ' м';
+    }
+    if (preg_match('/(\d+(?:[.,]\d+)?)/', $raw, $m)) {
+        $num = (float) str_replace(',', '.', $m[1]);
+        if ($num >= 100) $num /= 100;
+        return number_format($num,2,'.','') . ' м';
+    }
+    return trim($raw);
+}
+
+private function normalize_spool($raw) {
+    $s = trim((string)$raw);
+    if ($s === '') return '';
+    $s = preg_replace('/\s+/', '', $s);
+    $s = mb_strtoupper($s);
+
+    // C5000 -> 5000C
+    if (preg_match('/^([A-Z]+)(\d+)(.*)$/', $s, $m)) {
+        return $m[2] . $m[1] . ($m[3] ?? '');
+    }
+    // 3000D-C -> 3000D-C (пропускаем как есть)
+    if (preg_match('/^(\d+)([A-Z0-9\-\_]*)$/', $s, $m)) {
+        return $m[1] . ($m[2] ?? '');
+    }
+    // если есть где-то число — переносим в начало
+    if (preg_match('/(\d+)/', $s, $m)) {
+        $num = $m[1];
+        $rest = preg_replace('/.*' . preg_quote($num,'/') . '/', '', $s);
+        return $num . $rest;
+    }
+    return $s;
+}
+
+private function build_slug($name, $field_test='', $field_length='', $field_spool='') {
+    $parts = [ (string)$name ];
+    if ($field_test)   $parts[] = $field_test;
+    if ($field_length) $parts[] = $field_length;
+    if ($field_spool)  $parts[] = $field_spool;
+    $slug = sanitize_title(implode('-', $parts));
+    return substr($slug, 0, 191);
+}
 		
 		public function admin_page_types() {
     global $wpdb;
@@ -194,173 +302,175 @@ class TackleRatingPlugin {
     <?php
 }
 		
-		public function admin_page_items($type_id = 0) {
+		public function admin_page_items($rating_type_id) {
     global $wpdb;
 
-    $rating_type_id = intval($type_id);
-    if (!$rating_type_id) {
-        echo '<div class="notice notice-error"><p>Не указан тип рейтинга.</p></div>';
-        return;
-    }
-
-    // Получаем тип
-    $rating_type = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table_types} WHERE id = %d", $rating_type_id));
-    if (!$rating_type) {
-        echo '<div class="notice notice-error"><p>Тип не найден.</p></div>';
-        return;
-    }
-
-    // категории для этого типа
-    $categories = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$this->table_categories} WHERE rating_type_id = %d ORDER BY name ASC", $rating_type_id));
-
-    $filter = isset($_GET['approved']) ? intval($_GET['approved']) : -1; // -1 = все
-    $category_filter = isset($_GET['category_id']) ? intval($_GET['category_id']) : 0;
-
-    // Получаем варианты для этого типа (и фильтруем при необходимости)
-    if ($filter === -1 && $category_filter === 0) {
-        $items = $wpdb->get_results($wpdb->prepare("SELECT i.*, c.name AS category_name FROM {$this->table_items} i LEFT JOIN {$this->table_categories} c ON i.category_id = c.id WHERE i.rating_type_id = %d ORDER BY i.votes DESC, i.name ASC", $rating_type_id));
-    } elseif ($filter === -1) {
-        $items = $wpdb->get_results($wpdb->prepare("SELECT i.*, c.name AS category_name FROM {$this->table_items} i LEFT JOIN {$this->table_categories} c ON i.category_id = c.id WHERE i.rating_type_id = %d AND i.category_id = %d ORDER BY i.votes DESC, i.name ASC", $rating_type_id, $category_filter));
-    } elseif ($category_filter === 0) {
-        $items = $wpdb->get_results($wpdb->prepare("SELECT i.*, c.name AS category_name FROM {$this->table_items} i LEFT JOIN {$this->table_categories} c ON i.category_id = c.id WHERE i.rating_type_id = %d AND i.approved = %d ORDER BY i.votes DESC, i.name ASC", $rating_type_id, $filter));
-    } else {
-        $items = $wpdb->get_results($wpdb->prepare("SELECT i.*, c.name AS category_name FROM {$this->table_items} i LEFT JOIN {$this->table_categories} c ON i.category_id = c.id WHERE i.rating_type_id = %d AND i.approved = %d AND i.category_id = %d ORDER BY i.votes DESC, i.name ASC", $rating_type_id, $filter, $category_filter));
-    }
-
-    // max votes для процентов
+    // 1) Получаем элементы текущего типа для расчёта процентов
+    $items = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT * FROM {$this->table_items} WHERE rating_type_id = %d ORDER BY votes DESC, name ASC",
+            $rating_type_id
+        )
+    );
     $max_votes = 0;
-    foreach ($items as $it) if ($it->votes > $max_votes) $max_votes = $it->votes;
+    foreach ($items as $it) {
+        if ($it->votes > $max_votes) {
+            $max_votes = $it->votes;
+        }
+    }
+
+    // 2) Категории текущего типа (для селекта)
+    $categories = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT * FROM {$this->table_categories} WHERE rating_type_id = %d ORDER BY name ASC",
+            $rating_type_id
+        )
+    );
+
+    // 3) Список активных «дополнительных» полей для этого типа (если хранишь их в таблице)
+    // Если у тебя нет таблицы активных полей, можно заменить это на статический массив:
+    // $active_fields = [
+    //     (object)['slug' => 'test',   'label' => 'Тест'],
+    //     (object)['slug' => 'length', 'label' => 'Длина'],
+    //     (object)['slug' => 'spool',  'label' => 'Объем шпули'],
+    // ];
+    $active_fields = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT * FROM {$this->table_fields} WHERE rating_type_id = %d ORDER BY id ASC",
+            $rating_type_id
+        )
+    );
+
+    /* ---------------- ВОТ ЗДЕСЬ БЛОК СОХРАНЕНИЯ ---------------- */
+    if (isset($_POST['tackle_save_items']) && check_admin_referer('tackle_save_items_action', 'tackle_save_items_nonce')) {
+
+        foreach ((array)($_POST['name'] ?? []) as $id => $name_raw) {
+            $id = (int)$id;
+
+            // 1) Собираем сырые значения из POST
+            $name        = sanitize_text_field($name_raw);
+            $test_raw    = isset($_POST['test'][$id])   ? sanitize_text_field($_POST['test'][$id])   : '';
+            $length_raw  = isset($_POST['length'][$id]) ? sanitize_text_field($_POST['length'][$id]) : '';
+            $spool_raw   = isset($_POST['spool'][$id])  ? sanitize_text_field($_POST['spool'][$id])  : '';
+            $category_id = isset($_POST['category'][$id]) ? (int)$_POST['category'][$id] : 0;
+
+            // 2) Нормализуем параметры
+            $test   = $this->normalize_test($test_raw);
+            $length = $this->normalize_length($length_raw);
+            $spool  = $this->normalize_spool($spool_raw);
+
+            // 3) Базовый слаг из названия
+            $base_slug = sanitize_title($name);
+
+            // 4) Добавляем нормализованные параметры в слаг (только непустые)
+            $slug_parts = [$base_slug];
+            if ($test !== '')   { $slug_parts[] = sanitize_title($test); }
+            if ($length !== '') { $slug_parts[] = sanitize_title($length); }
+            if ($spool !== '')  { $slug_parts[] = sanitize_title($spool); }
+            $slug = substr(implode('-', $slug_parts), 0, 191);
+
+            // 5) Формируем массив для UPDATE
+            $update = [
+                'name'         => $name,
+                'slug'         => $slug,
+                'field_test'   => $test,
+                'field_length' => $length,
+                'field_spool'  => $spool,
+            ];
+            if ($category_id > 0) {
+                $update['category_id'] = $category_id;
+            }
+
+            // 6) Обновляем запись
+            $wpdb->update(
+                $this->table_items,
+                $update,
+                ['id' => $id],
+                // форматы для $update
+                array_merge(
+                    ['%s','%s','%s','%s','%s'],
+                    $category_id > 0 ? ['%d'] : []
+                ),
+                // форматы для WHERE
+                ['%d']
+            );
+        }
+
+        echo '<div class="updated"><p>Изменения сохранены</p></div>';
+
+        // Перечитываем список после сохранения
+        $items = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM {$this->table_items} WHERE rating_type_id = %d ORDER BY votes DESC, name ASC",
+                $rating_type_id
+            )
+        );
+        $max_votes = 0;
+        foreach ($items as $it) {
+            if ($it->votes > $max_votes) $max_votes = $it->votes;
+        }
+    }
+    /* ---------------- КОНЕЦ БЛОКА СОХРАНЕНИЯ ---------------- */
+
+    // 4) Рендер таблицы
     ?>
-    <div class="wrap" id="tackle-admin-items" data-type-id="<?= intval($rating_type_id) ?>">
-        <h1>Варианты — <?= esc_html($rating_type->name) ?></h1>
-
-        <form method="GET" style="margin-bottom:15px;">
-            <input type="hidden" name="page" value="tackle-rating-items-<?= intval($rating_type_id) ?>" />
-            <label>Фильтр: 
-                <select name="approved" onchange="this.form.submit()">
-                    <option value="-1" <?= $filter === -1 ? 'selected' : '' ?>>Все</option>
-                    <option value="1" <?= $filter === 1 ? 'selected' : '' ?>>Одобренные</option>
-                    <option value="0" <?= $filter === 0 ? 'selected' : '' ?>>Неодобренные</option>
-                </select>
-            </label>
-            &nbsp;&nbsp;
-            <label>Категория:
-                <select name="category_id" onchange="this.form.submit()">
-                    <option value="0">Все</option>
-                    <?php foreach ($categories as $cat): ?>
-                        <option value="<?= intval($cat->id) ?>" <?= $category_filter == $cat->id ? 'selected' : '' ?>><?= esc_html($cat->name) ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </label>
-        </form>
-
-        <form id="tackle-admin-form">
-            <table class="wp-list-table widefat fixed striped">
+    <div class="wrap">
+        <h1>Элементы рейтинга</h1>
+        <form method="post">
+            <?php wp_nonce_field('tackle_save_items_action', 'tackle_save_items_nonce'); ?>
+            <table class="widefat fixed striped">
                 <thead>
                     <tr>
-                        <th style="width:30px;"><input type="checkbox" id="tackle-select-all" /></th>
                         <th>Название</th>
-                        <th>Категория</th>
+                        <?php foreach ($active_fields as $f): ?>
+                            <th><?php echo esc_html($f->label); ?></th>
+                        <?php endforeach; ?>
                         <th>Голосов</th>
                         <th>Рейтинг (%)</th>
                         <th>Одобрен</th>
+                        <th>Категория</th>
                     </tr>
                 </thead>
                 <tbody>
-                    <?php if (!$items): ?>
-                        <tr><td colspan="6">Вариантов нет.</td></tr>
-                    <?php else: foreach ($items as $item): 
-                        $percent = $max_votes ? round(($item->votes / $max_votes) * 100) : 0;
-                    ?>
-                        <tr>
-                            <td><input type="checkbox" class="tackle-checkbox" name="ids[]" value="<?= intval($item->id) ?>" /></td>
-                            <td><?= esc_html($item->name) ?></td>
+                <?php foreach ($items as $item): ?>
+                    <?php $percent = $max_votes ? round(($item->votes / $max_votes) * 100, 1) : 0; ?>
+                    <tr>
+                        <td>
+                            <input type="text" name="name[<?php echo $item->id; ?>]" value="<?php echo esc_attr($item->name); ?>">
+                        </td>
+
+                        <?php
+                        // Подставляем значения полей в инпуты
+                        foreach ($active_fields as $f):
+                            $val = '';
+                            if ($f->slug === 'test')   $val = $item->field_test;
+                            if ($f->slug === 'length') $val = $item->field_length;
+                            if ($f->slug === 'spool')  $val = $item->field_spool;
+                        ?>
                             <td>
-								<select class="tackle-change-category" data-id="<?= intval($item->id) ?>">
-									<?php foreach ($categories as $cat): ?>
-										<option value="<?= intval($cat->id) ?>" <?= $cat->id == $item->category_id ? 'selected' : '' ?>>
-											<?= esc_html($cat->name) ?>
-										</option>
-									<?php endforeach; ?>
-								</select>
-							</td>
-                            <td><?= intval($item->votes) ?></td>
-                            <td><?= $percent ?>%</td>
-                            <td><?= $item->approved ? 'Да' : 'Нет' ?></td>
-                        </tr>
-                    <?php endforeach; endif; ?>
+                                <input type="text" name="<?php echo esc_attr($f->slug); ?>[<?php echo $item->id; ?>]" value="<?php echo esc_attr($val); ?>">
+                            </td>
+                        <?php endforeach; ?>
+
+                        <td><?php echo (int)$item->votes; ?></td>
+                        <td><?php echo $percent; ?>%</td>
+                        <td><?php echo $item->approved ? 'Да' : 'Нет'; ?></td>
+                        <td>
+                            <select name="category[<?php echo $item->id; ?>]">
+                                <?php foreach ($categories as $cat): ?>
+                                    <option value="<?php echo (int)$cat->id; ?>" <?php selected($cat->id, $item->category_id); ?>>
+                                        <?php echo esc_html($cat->name); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
                 </tbody>
             </table>
 
-            <div style="margin-top:10px;">
-                <button type="button" id="tackle-approve-btn" class="button button-primary">Одобрить выбранные</button>
-                <button type="button" id="tackle-delete-btn" class="button button-secondary">Удалить выбранные</button>
-                <button type="button" id="tackle-merge-btn" class="button">Объединить выбранные</button>
-            </div>
-
-            <div id="tackle-merge-section" style="margin-top:10px; display:none;">
-				<input type="text" id="tackle-merge-name" placeholder="Новое название" style="width:300px;" />
-				<select id="tackle-merge-category">
-					<option value="">Выберите категорию</option>
-					<?php foreach ($categories as $cat): ?>
-						<option value="<?= intval($cat->id) ?>"><?= esc_html($cat->name) ?></option>
-					<?php endforeach; ?>
-				</select>
-				<button type="button" id="tackle-merge-confirm" class="button button-primary">Объединить</button>
-				<button type="button" id="tackle-merge-cancel" class="button">Отмена</button>
-			</div>
+            <p><button type="submit" name="tackle_save_items" class="button button-primary">Сохранить изменения</button></p>
         </form>
-
-        <hr>
-
-        <h2>Добавить вариант вручную</h2>
-        <form id="tackle-add-manual-form">
-            <input type="hidden" id="tackle-add-manual-type-id" value="<?= intval($rating_type_id) ?>" />
-            <label>Название: <input type="text" id="tackle-add-manual-name" required style="width:300px;" /></label>
-            <label>Категория: 
-                <select id="tackle-add-manual-category">
-                    <option value="">Выберите категорию</option>
-                    <?php foreach ($categories as $cat): ?>
-                        <option value="<?= intval($cat->id) ?>"><?= esc_html($cat->name) ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </label>
-            <button type="submit" class="button button-primary">Добавить</button>
-        </form>
-        <div id="tackle-add-manual-msg" style="margin-top:10px;"></div>
-
-        <hr>
-
-        <h2>Управление категориями</h2>
-        <form id="tackle-add-category-form">
-            <input type="hidden" id="tackle-add-category-type-id" value="<?= intval($rating_type_id) ?>" />
-            <input type="text" id="tackle-add-category-name" placeholder="Название категории" style="width:300px;" required />
-            <button type="submit" class="button">Добавить категорию</button>
-        </form>
-        <div id="tackle-add-category-msg" style="margin-top:10px;"></div>
-		<h3>Список категорий</h3>
-<table class="wp-list-table widefat fixed striped" style="max-width:500px;">
-    <thead>
-        <tr>
-            <th>Категория</th>
-            <th style="width:80px;">Действия</th>
-        </tr>
-    </thead>
-    <tbody>
-        <?php if ($categories): ?>
-            <?php foreach ($categories as $cat): ?>
-                <tr>
-                    <td><?= esc_html($cat->name) ?></td>
-                    <td>
-                        <button type="button" class="button button-secondary tackle-delete-category" data-id="<?= intval($cat->id) ?>">Удалить</button>
-                    </td>
-                </tr>
-            <?php endforeach; ?>
-        <?php else: ?>
-            <tr><td colspan="2">Категорий нет</td></tr>
-        <?php endif; ?>
-    </tbody>
-</table>
     </div>
     <?php
 }
@@ -633,44 +743,70 @@ public function ajax_admin_delete_category() {
 
     wp_send_json_success('Категория удалена');
 }
+	
+	public function ajax_admin_set_type_fields() {
+    check_ajax_referer($this->nonce, 'nonce');
+    if (!current_user_can('manage_options')) wp_send_json_error('Нет прав');
+
+    global $wpdb;
+    $type_id = intval($_POST['type_id'] ?? 0);
+    $fields  = (array)($_POST['fields'] ?? []);
+
+    if (!$type_id) wp_send_json_error('Нет type_id');
+
+    // Фильтруем по допустимым ключам
+    $fields = array_values(array_intersect($fields, $this->allowed_field_keys));
+
+    // чистим и пересоздаём
+    $wpdb->delete($this->table_type_fields, ['rating_type_id' => $type_id], ['%d']);
+    foreach ($fields as $key) {
+        $wpdb->insert($this->table_type_fields, [
+            'rating_type_id' => $type_id,
+            'field_key'      => $key
+        ], ['%d','%s']);
+    }
+    wp_send_json_success('Сохранено');
+}
 
     // AJAX: Добавить вручную (админка)
     public function ajax_admin_add_manual() {
     check_ajax_referer($this->nonce, 'nonce');
     if (!current_user_can('manage_options')) wp_send_json_error('Доступ запрещён');
 
-    $name = isset($_POST['name']) ? sanitize_text_field($_POST['name']) : '';
-    $type_id = isset($_POST['type_id']) ? intval($_POST['type_id']) : 0;
+    $name        = isset($_POST['name']) ? sanitize_text_field($_POST['name']) : '';
+    $type_id     = isset($_POST['type_id']) ? intval($_POST['type_id']) : 0;
     $category_id = isset($_POST['category_id']) ? intval($_POST['category_id']) : 0;
+
+    // дополнительные (могут быть не отправлены)
+    $field_test   = isset($_POST['field_test'])   ? $this->normalize_test($_POST['field_test'])     : '';
+    $field_length = isset($_POST['field_length']) ? $this->normalize_length($_POST['field_length']) : '';
+    $field_spool  = isset($_POST['field_spool'])  ? $this->normalize_spool($_POST['field_spool'])   : '';
 
     if (!$name || !$type_id || !$category_id) wp_send_json_error('Введите название, тип и категорию');
 
     global $wpdb;
-		
-	$slug = sanitize_title($name);
-	$slug = substr($slug, 0, 255);
 
-    // Проверка уникальности в данном типе+категории
+    $slug = $this->build_slug($name, $field_test, $field_length, $field_spool);
+
     $exists = $wpdb->get_var($wpdb->prepare("
-    SELECT COUNT(*) FROM {$this->table_items} 
-    WHERE rating_type_id = %d AND category_id = %d AND slug = %s
-", $type_id, $category_id, $slug));
+        SELECT COUNT(*) FROM {$this->table_items} 
+        WHERE rating_type_id = %d AND category_id = %d AND slug = %s
+    ", $type_id, $category_id, $slug));
+    if ($exists) wp_send_json_error('Такой вариант уже есть');
 
-    $inserted = $wpdb->insert(
-    $this->table_items,
-    [
+    $ok = $wpdb->insert($this->table_items, [
         'rating_type_id' => $type_id,
         'category_id'    => $category_id,
         'name'           => $name,
         'slug'           => $slug,
+        'field_test'     => $field_test,
+        'field_length'   => $field_length,
+        'field_spool'    => $field_spool,
         'votes'          => 1,
-        'approved'       => 1 // или 0 в случае предложений
-    ],
-    ['%d','%d','%s','%s','%d','%d']
-);
+        'approved'       => 1
+    ], ['%d','%d','%s','%s','%s','%s','%s','%d','%d']);
 
-    if (!$inserted) wp_send_json_error('Ошибка добавления: ' . $wpdb->last_error);
-
+    if (!$ok) wp_send_json_error('Ошибка добавления: ' . $wpdb->last_error);
     wp_send_json_success('Вариант добавлен');
 }
 	
@@ -770,6 +906,11 @@ public function ajax_admin_add_category() {
         echo "<p>Для этого рейтинга ещё нет категорий.</p>";
         return;
     }
+		
+		
+		$active_field_keys = $wpdb->get_col(
+    $wpdb->prepare("SELECT field_key FROM {$this->table_type_fields} WHERE rating_type_id = %d", $type_id)
+);
 
     // Получаем все варианты для этого типа
     $items = $wpdb->get_results($wpdb->prepare("
@@ -831,6 +972,15 @@ public function ajax_admin_add_category() {
                     <?php endforeach; ?>
                 </select>
             </label>
+			<?php if (in_array('test',$active_field_keys)): ?>
+			  <p><label>Тест:</label><br><input type="text" name="test"></p>
+			<?php endif; ?>
+			<?php if (in_array('length',$active_field_keys)): ?>
+			  <p><label>Длина:</label><br><input type="text" name="length"></p>
+			<?php endif; ?>
+			<?php if (in_array('spool',$active_field_keys)): ?>
+			  <p><label>Объём шпули:</label><br><input type="text" name="spool"></p>
+			<?php endif; ?>
             <button class="btn" type="submit">Предложить</button>
         </form>
         <div class="tackle-suggest-msg" style="margin-top: 10px;"></div>
@@ -918,48 +1068,54 @@ public function ajax_admin_add_category() {
 
 
     // AJAX: Предложить вариант
-public function ajax_suggest() {
+	
+		public function ajax_tackle_suggest() {
     check_ajax_referer($this->nonce, 'nonce');
 
-    $name = isset($_POST['name']) ? sanitize_text_field(trim($_POST['name'])) : '';
-    $type_id = isset($_POST['type_id']) ? intval($_POST['type_id']) : 0;
-    $category_id = isset($_POST['category_id']) ? intval($_POST['category_id']) : 0;
+    global $wpdb;
+    $name        = sanitize_text_field($_POST['name'] ?? '');
+    $type_id     = intval($_POST['type_id'] ?? 0);
+    $category_id = intval($_POST['category_id'] ?? 0);
+
+    $field_test   = $this->normalize_test($_POST['test']   ?? '');
+    $field_length = $this->normalize_length($_POST['length'] ?? '');
+    $field_spool  = $this->normalize_spool($_POST['spool']  ?? '');
 
     if (!$name || !$type_id || !$category_id) {
-        wp_send_json_error('Заполните все поля');
+        wp_send_json_error('Заполните все обязательные поля');
     }
 
-    global $wpdb;
+    $slug = $this->build_slug($name, $field_test, $field_length, $field_spool);
 
-    $slug = sanitize_title($name);
-    $slug = substr($slug, 0, 255);
-
-    // Проверка уникальности
-    $exists = $wpdb->get_var($wpdb->prepare("
-        SELECT COUNT(*) FROM {$this->table_items}
-        WHERE rating_type_id = %d AND category_id = %d AND slug = %s
+    $exists = $wpdb->get_row($wpdb->prepare("
+        SELECT * FROM {$this->table_items}
+        WHERE rating_type_id=%d AND category_id=%d AND slug=%s
     ", $type_id, $category_id, $slug));
 
-    if ($exists) wp_send_json_error('Такой вариант уже есть');
-
-    $inserted = $wpdb->insert(
-        $this->table_items,
-        [
-            'rating_type_id' => $type_id,
-            'category_id'    => $category_id,
-            'name'           => $name,
-            'slug'           => $slug,
-            'votes'          => 1,   // можно оставить 1 или поставить 0 — см. ниже
-            'approved'       => 0    // <- СДЕЛАНО: сначала не одобрен
-        ],
-        ['%d','%d','%s','%s','%d','%d']
-    );
-
-    if ($inserted) {
-        wp_send_json_success('Спасибо за предложение! Вариант появится после одобрения.');
-    } else {
-        wp_send_json_error('Ошибка добавления варианта');
+    if ($exists) {
+        // если есть — +1 голос
+        $wpdb->update($this->table_items, [
+            'approved' => 1,
+            'votes'    => $exists->votes + 1
+        ], ['id' => $exists->id], ['%d','%d'], ['%d']);
+        wp_send_json_success('Такой вариант уже был — добавили +1 голос');
     }
+
+    // создаём, но не одобряем
+    $ok = $wpdb->insert($this->table_items, [
+        'rating_type_id' => $type_id,
+        'category_id'    => $category_id,
+        'name'           => $name,
+        'slug'           => $slug,
+        'field_test'     => $field_test,
+        'field_length'   => $field_length,
+        'field_spool'    => $field_spool,
+        'votes'          => 1,
+        'approved'       => 0
+    ], ['%d','%d','%s','%s','%s','%s','%s','%d','%d']);
+
+    if ($ok) wp_send_json_success('Ваш вариант отправлен на модерацию');
+    wp_send_json_error('Ошибка добавления');
 }
 
 }
