@@ -152,4 +152,28 @@ $('#tackle-merge-confirm').on('click', function(){
 
     // Select all (на странице типа)
     $('#tackle-select-all').on('change', function(){ $('.tackle-checkbox').prop('checked', $(this).prop('checked')); });
+	
+	
+	
+$('#tackle-save-type-fields').on('click', function(){
+    var typeId = $(this).data('type-id');
+    var fields = [];
+    $('.tackle-field-toggle:checked').each(function(){
+      fields.push($(this).data('key'));
+    });
+
+    $.post(tackleAdmin.ajax_url, {
+      action: 'tackle_admin_set_type_fields',
+      nonce: tackleAdmin.nonce,
+      type_id: typeId,
+      fields: fields
+    }, function(res){
+      $('#tackle-save-type-fields-msg').text(res && res.success ? 'Сохранено' : (res.data || 'Ошибка'));
+      if (res && res.success) {
+        // обновить страницу, чтобы появились/исчезли колонки
+        location.reload();
+      }
+    }, 'json');
+  });	
+
 });
