@@ -114,5 +114,50 @@ jQuery(function ($) {
             $bar.stop(true).animate({ width: item.percent + '%' }, 800);
         });
     }
+	
+	
+	
+	// Голосование за несколько
+  $(document).on('submit', '.tackle-vote-form', function(e){
+    e.preventDefault();
+    var $wrap = $(this).closest('.tackle-rating-frontend');
+    var typeId = $wrap.data('type-id');
+    var ids = $(this).find('input[name="vote_ids[]"]:checked').map(function(){return $(this).val();}).get();
+    if(!ids.length){ alert('Выберите варианты'); return; }
+
+    $.post(tackleFrontend.ajax_url, {
+      action: 'tackle_vote_multiple',
+      nonce: tackleFrontend.nonce,
+      type_id: typeId,
+      ids: ids
+    }, function(res){
+      if(res && res.success){
+        // обновление шкал и чисел — оставь свой updateRatings или просто reload:
+        location.reload();
+      } else {
+        alert(res && res.data ? res.data : 'Ошибка');
+      }
+    }, 'json');
+  });
+
+  // Предложить вариант
+  $(document).on('submit', '.tackle-suggest-form', function(e){
+    e.preventDefault();
+    var $f = $(this);
+    var data = $f.serializeArray();
+    var payload = { action: 'tackle_suggest', nonce: tackleFrontend.nonce };
+    data.forEach(function(p){ payload[p.name] = p.value; });
+
+    $.post(tackleFrontend.ajax_url, payload, function(res){
+      var $msg = $f.find('.tackle-suggest-msg');
+      if(res && res.success){
+        $msg.text(res.data || 'Спасибо!');
+        $f[0].reset();
+      } else {
+        $msg.text(res && res.data ? res.data : 'Ошибка');
+      }
+    }, 'json');
+  });
+	
 
 });
